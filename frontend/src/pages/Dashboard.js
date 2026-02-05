@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 import './Dashboard.css';
 
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3000/api';
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'https://whatsapp-automation-xqw7.vercel.app/api';
 
 const Dashboard = () => {
   const [status, setStatus] = useState({ isReady: false });
@@ -73,7 +73,8 @@ const Dashboard = () => {
 
     streamingMsgIds.forEach(messageId => {
       if (!eventSourceRefsMap.has(messageId)) {
-        const baseUrl = apiUrl.replace('/api', '');
+        // Remove /api suffix if present for base URL
+        const baseUrl = apiUrl.endsWith('/api') ? apiUrl.replace('/api', '') : apiUrl.replace(/\/api\/?$/, '');
         console.log(`[SSE] Connecting to stream for messageId: ${messageId}`);
         const eventSource = new EventSource(`${baseUrl}/api/stream/${messageId}`);
         

@@ -10,10 +10,11 @@ const app = express();
 app.use((req, res, next) => {
   if (req.path === '/webhook/whatsapp' || req.path === '/webhook/test') {
     console.log(`\n[${new Date().toISOString()}] ${req.method} ${req.path}`);
-    console.log('IP:', req.ip || req.connection.remoteAddress);
+    console.log('IP:', req.ip || req.connection.remoteAddress || req.socket.remoteAddress);
     console.log('User-Agent:', req.get('user-agent'));
     console.log('Content-Type:', req.get('content-type'));
     console.log('Request body:', JSON.stringify(req.body, null, 2));
+    console.log('Raw body keys:', Object.keys(req.body || {}));
   }
   next();
 });
@@ -45,7 +46,63 @@ const messageStore = {
   outgoing: []   // Messages sent by bot
 };
 
-// Get AI response from OpenAI
+// Store active streaming responses for real-time updates
+const activeStreams = new Map(); // messageId -> { fullText: '', isComplete: false }
+
+// Get AI response from OpenAI (streaming version)
+async function getAIResponseStream(userMessage, messageId) {
+  try {
+    const stream = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [
+        {
+          role: "system",
+          content: "You are a helpful WhatsApp assistant. Keep responses concise and friendly."
+        },
+        {
+          role: "user",
+          content: userMessage
+        }
+      ],
+      max_tokens: 200,
+      stream: true
+    });
+
+    let fullResponse = '';
+    
+    // Initialize stream tracking
+    activeStreams.set(messageId, { fullText: '', isComplete: false });
+
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content || '';
+      if (content) {
+        fullResponse += content;
+        // Update stream in real-time for token-by-token display
+        // Force update to trigger SSE push
+        activeStreams.set(messageId, { fullText: fullResponse, isComplete: false });
+      }
+    }
+    
+    // Small delay to ensure last token is sent
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // Mark as complete
+    activeStreams.set(messageId, { fullText: fullResponse, isComplete: true });
+    
+    // Clean up after 30 seconds
+    setTimeout(() => {
+      activeStreams.delete(messageId);
+    }, 30000);
+
+    return fullResponse;
+  } catch (error) {
+    console.error('OpenAI API Error:', error);
+    activeStreams.delete(messageId);
+    return "Sorry, I'm having trouble processing your request right now. Please try again later.";
+  }
+}
+
+// Get AI response from OpenAI (non-streaming fallback)
 async function getAIResponse(userMessage) {
   try {
     const completion = await openai.chat.completions.create({
@@ -60,7 +117,7 @@ async function getAIResponse(userMessage) {
           content: userMessage
         }
       ],
-      max_tokens: 150
+      max_tokens: 200
     });
 
     return completion.choices[0].message.content;
@@ -88,16 +145,31 @@ app.post('/webhook/whatsapp', async (req, res) => {
     console.log('Query:', JSON.stringify(req.query, null, 2));
     console.log('═══════════════════════════════════════');
     
-    const incomingMessage = req.body.Body || req.body.body;
-    const from = req.body.From || req.body.from; // Format: whatsapp:+1234567890
-    const messageSid = req.body.MessageSid || req.body.messageSid;
-    const profileName = req.body.ProfileName || req.body.profileName || 'Unknown';
+    // Try multiple possible field names (Twilio can send different formats)
+    const incomingMessage = req.body.Body || req.body.body || req.body.Body || req.body['Body'];
+    const from = req.body.From || req.body.from || req.body['From'];
+    const messageSid = req.body.MessageSid || req.body.messageSid || req.body.MessageSid || req.body['MessageSid'];
+    const profileName = req.body.ProfileName || req.body.profileName || req.body['ProfileName'] || 'Unknown';
+    const accountSid = req.body.AccountSid || req.body.accountSid || req.body['AccountSid'];
+
+    console.log('Parsed fields:', {
+      hasBody: !!incomingMessage,
+      hasFrom: !!from,
+      hasMessageSid: !!messageSid,
+      hasAccountSid: !!accountSid,
+      bodyValue: incomingMessage,
+      fromValue: from
+    });
 
     // Validate required fields
     if (!incomingMessage || !from) {
-      console.error('Missing required fields:', { incomingMessage: !!incomingMessage, from: !!from });
-      console.error('Full body:', req.body);
-      return res.status(400).send('Missing required fields');
+      console.error('❌ Missing required fields!');
+      console.error('Body field:', incomingMessage);
+      console.error('From field:', from);
+      console.error('All body keys:', Object.keys(req.body || {}));
+      console.error('Full body:', JSON.stringify(req.body, null, 2));
+      // Still return 200 to prevent Twilio from retrying
+      return res.status(200).send('OK - Missing fields logged');
     }
 
     const timestamp = new Date();
@@ -132,10 +204,34 @@ app.post('/webhook/whatsapp', async (req, res) => {
     
     console.log(`✓ Stored incoming message. Total incoming: ${messageStore.incoming.length}`);
 
-    // Get AI response
-    console.log('Getting AI response from OpenAI...');
-    const aiResponse = await getAIResponse(incomingMessage);
+    // Create a temporary message ID for streaming (use messageSid if available for better tracking)
+    const tempMessageId = messageSid ? `stream_${messageSid}` : `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Store a placeholder outgoing message that will be updated
+    const placeholderOutgoingMsg = {
+      id: tempMessageId,
+      to: from,
+      toNumber: from.replace('whatsapp:', ''),
+      message: '', // Will be updated as stream progresses
+      timestamp: new Date().toISOString(),
+      type: 'outgoing',
+      status: 'streaming',
+      isStreaming: true,
+      relatedIncomingId: incomingMsg.id
+    };
+    messageStore.outgoing.unshift(placeholderOutgoingMsg);
+
+    // Get AI response with streaming
+    console.log('Getting AI response from OpenAI (streaming)...');
+    const aiResponse = await getAIResponseStream(incomingMessage, tempMessageId);
     console.log(`AI Response: ${aiResponse}`);
+    
+    // Update the placeholder message with final response
+    const outgoingIndex = messageStore.outgoing.findIndex(m => m.id === tempMessageId);
+    if (outgoingIndex !== -1) {
+      messageStore.outgoing[outgoingIndex].message = aiResponse;
+      messageStore.outgoing[outgoingIndex].isStreaming = false;
+    }
 
     // Send response via Twilio
     const sentMessage = await twilioClient.messages.create({
@@ -144,17 +240,24 @@ app.post('/webhook/whatsapp', async (req, res) => {
       body: aiResponse
     });
 
-    // Store outgoing message
-    const outgoingMsg = {
-      id: sentMessage.sid,
-      to: from,
-      toNumber: from.replace('whatsapp:', ''),
-      message: aiResponse,
-      timestamp: new Date().toISOString(),
-      type: 'outgoing',
-      status: sentMessage.status
-    };
-    messageStore.outgoing.unshift(outgoingMsg);
+    // Update the placeholder message with final Twilio SID and status
+    // Keep original tempMessageId for streaming tracking, but also store the final SID
+    const finalOutgoingIndex = messageStore.outgoing.findIndex(m => m.id === tempMessageId);
+    if (finalOutgoingIndex !== -1) {
+      // Update stream map to use final SID as well
+      if (activeStreams.has(tempMessageId)) {
+        const streamData = activeStreams.get(tempMessageId);
+        activeStreams.set(sentMessage.sid, streamData);
+        activeStreams.delete(tempMessageId);
+      }
+      
+      // Update message with final SID but keep original ID for tracking
+      messageStore.outgoing[finalOutgoingIndex].id = sentMessage.sid;
+      messageStore.outgoing[finalOutgoingIndex].originalStreamId = tempMessageId; // Keep reference
+      messageStore.outgoing[finalOutgoingIndex].status = sentMessage.status;
+      messageStore.outgoing[finalOutgoingIndex].isStreaming = false;
+    }
+    
     // Keep only last 1000 messages
     if (messageStore.outgoing.length > 1000) {
       messageStore.outgoing = messageStore.outgoing.slice(0, 1000);
@@ -360,6 +463,88 @@ app.post('/api/send-message', async (req, res) => {
   }
 });
 
+// Server-Sent Events endpoint for real-time streaming updates
+app.get('/api/stream/:messageId', (req, res) => {
+  const { messageId } = req.params;
+  
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  // Send initial connection message
+  res.write(`data: ${JSON.stringify({ type: 'connected', messageId })}\n\n`);
+
+  // Track last sent text to avoid duplicate sends
+  let lastSentText = '';
+  
+  // Check for stream updates every 20ms for smoother token-by-token display
+  const interval = setInterval(() => {
+    // Try both messageId and check if it's in activeStreams
+    let streamData = null;
+    let foundId = null;
+    
+    // Check exact match first
+    if (activeStreams.has(messageId)) {
+      streamData = activeStreams.get(messageId);
+      foundId = messageId;
+    } else {
+      // Try to find by partial match (in case of stream_ prefix)
+      for (const [id, data] of activeStreams.entries()) {
+        if (id === messageId || id.includes(messageId) || messageId.includes(id)) {
+          streamData = data;
+          foundId = id;
+          break;
+        }
+      }
+    }
+    
+    if (streamData && foundId) {
+      // Only send if text has changed (avoid duplicate sends)
+      if (streamData.fullText !== lastSentText) {
+        res.write(`data: ${JSON.stringify({
+          type: 'update',
+          messageId: foundId,
+          text: streamData.fullText,
+          isComplete: streamData.isComplete
+        })}\n\n`);
+        lastSentText = streamData.fullText;
+      }
+
+      if (streamData.isComplete) {
+        clearInterval(interval);
+        res.write(`data: ${JSON.stringify({ type: 'complete', messageId: foundId })}\n\n`);
+        setTimeout(() => res.end(), 100);
+      }
+    } else {
+      // Stream not found - check if message exists and is complete
+      const outgoingMsg = messageStore.outgoing.find(m => 
+        m.id === messageId || 
+        m.originalStreamId === messageId ||
+        m.id?.includes(messageId)
+      );
+      if (outgoingMsg && !outgoingMsg.isStreaming) {
+        // Message is complete, send final update
+        res.write(`data: ${JSON.stringify({
+          type: 'update',
+          messageId,
+          text: outgoingMsg.message,
+          isComplete: true
+        })}\n\n`);
+        clearInterval(interval);
+        res.write(`data: ${JSON.stringify({ type: 'complete', messageId })}\n\n`);
+        setTimeout(() => res.end(), 100);
+      }
+    }
+  }, 20);
+
+  // Cleanup on client disconnect
+  req.on('close', () => {
+    clearInterval(interval);
+    res.end();
+  });
+});
+
 // Get all messages (incoming and outgoing)
 app.get('/api/messages', (req, res) => {
   try {
@@ -429,44 +614,57 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Export for Vercel serverless functions
+module.exports = app;
+
+// Only start server if not in Vercel environment
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('\n========================================');
-  console.log('🚀 WhatsApp Bot Server Started');
-  console.log('========================================');
-  console.log(`📡 Server running on port ${PORT}`);
-  console.log(`📱 Twilio Account SID: ${process.env.TWILIO_ACCOUNT_SID}`);
-  console.log(`💬 Twilio WhatsApp Number: ${TWILIO_WHATSAPP_NUMBER}`);
-  console.log(`\n🔗 Webhook Configuration:`);
-  console.log(`   Local: http://localhost:${PORT}/webhook/whatsapp`);
-  console.log(`   (Use ngrok for public URL: ngrok http ${PORT})`);
-  console.log(`\n📋 Configure webhook in Twilio Console:`);
-  console.log(`   https://console.twilio.com/us1/develop/sms/settings/whatsapp-sandbox`);
-  console.log(`   Set "When a message comes in" to your webhook URL`);
-  console.log(`\n✅ API Endpoints:`);
-  console.log(`   GET  /api/status - Check bot status`);
-  console.log(`   GET  /api/test-twilio - Test Twilio connection`);
-  console.log(`   GET  /api/messages - Get all messages`);
-  console.log(`   GET  /api/debug/messages - Debug: View stored messages`);
-  console.log(`   POST /api/send-message - Send message manually`);
-  console.log(`   POST /webhook/whatsapp - Twilio webhook (auto-reply)`);
-  console.log(`   GET  /webhook/whatsapp - Test webhook accessibility`);
-  console.log(`   ALL  /webhook/test - Test webhook connectivity (any method)`);
-  console.log(`\n🔗 Your Webhook URL (from .env):`);
-  console.log(`   ${WEBHOOK_FULL_URL}`);
-  console.log(`   Test endpoint: ${NGROK_WEBHOOK_URL}/webhook/test`);
-  console.log(`\n🔍 Webhook Setup:`);
-  console.log(`   1. Update NGROK_WEBHOOK_URL in .env file if ngrok URL changes`);
-  console.log(`   2. Configure in Twilio Console:`);
-  console.log(`      https://console.twilio.com/us1/develop/sms/settings/whatsapp-sandbox`);
-  console.log(`   3. Set "When a message comes in" to:`);
-  console.log(`      ${WEBHOOK_FULL_URL}`);
-  console.log(`   4. Method: POST`);
-  console.log(`   5. Test: Visit ${NGROK_WEBHOOK_URL}/webhook/test`);
-  console.log(`\n📋 Debugging:`);
-  console.log(`   - Check server logs when messages arrive`);
-  console.log(`   - Visit /api/debug/messages to see stored messages`);
-  console.log(`   - Check ngrok web interface: http://localhost:4040`);
-  console.log(`   - See WEBHOOK_TROUBLESHOOTING.md for detailed guide`);
-  console.log(`========================================\n`);
-});
+if (process.env.VERCEL !== '1') {
+  app.listen(PORT, () => {
+    console.log('\n========================================');
+    console.log('🚀 WhatsApp Bot Server Started');
+    console.log('========================================');
+    console.log(`📡 Server running on port ${PORT}`);
+    console.log(`📱 Twilio Account SID: ${process.env.TWILIO_ACCOUNT_SID}`);
+    console.log(`💬 Twilio WhatsApp Number: ${TWILIO_WHATSAPP_NUMBER}`);
+    console.log(`\n🔗 Webhook Configuration:`);
+    console.log(`   Local: http://localhost:${PORT}/webhook/whatsapp`);
+    console.log(`   (Use ngrok for public URL: ngrok http ${PORT})`);
+    console.log(`\n📋 Configure webhook in Twilio Console:`);
+    console.log(`   https://console.twilio.com/us1/develop/sms/settings/whatsapp-sandbox`);
+    console.log(`   Set "When a message comes in" to your webhook URL`);
+    console.log(`\n✅ API Endpoints:`);
+    console.log(`   GET  /api/status - Check bot status`);
+    console.log(`   GET  /api/test-twilio - Test Twilio connection`);
+    console.log(`   GET  /api/messages - Get all messages`);
+    console.log(`   GET  /api/debug/messages - Debug: View stored messages`);
+    console.log(`   POST /api/send-message - Send message manually`);
+    console.log(`   POST /webhook/whatsapp - Twilio webhook (auto-reply)`);
+    console.log(`   GET  /webhook/whatsapp - Test webhook accessibility`);
+    console.log(`   ALL  /webhook/test - Test webhook connectivity (any method)`);
+    console.log(`\n🔗 Your Webhook URL (from .env):`);
+    console.log(`   ${WEBHOOK_FULL_URL}`);
+    console.log(`   Test endpoint: ${NGROK_WEBHOOK_URL}/webhook/test`);
+    console.log(`\n⚠️  IMPORTANT: Check if webhook is receiving requests!`);
+    console.log(`   If you don't see "=== WEBHOOK RECEIVED FROM TWILIO ===" when a message arrives,`);
+    console.log(`   the webhook is not configured correctly in Twilio Console.`);
+    console.log(`\n🔍 Webhook Setup:`);
+    console.log(`   1. Update NGROK_WEBHOOK_URL in .env file if ngrok URL changes`);
+    console.log(`   2. Configure in Twilio Console:`);
+    console.log(`      https://console.twilio.com/us1/develop/sms/settings/whatsapp-sandbox`);
+    console.log(`   3. Set "When a message comes in" to:`);
+    console.log(`      ${WEBHOOK_FULL_URL}`);
+    console.log(`   4. Method: POST`);
+    console.log(`   5. Test: Visit ${NGROK_WEBHOOK_URL}/webhook/test`);
+    console.log(`   6. Check Twilio Logs: https://console.twilio.com/us1/monitor/logs/sms`);
+    console.log(`\n📋 Debugging:`);
+    console.log(`   - Check server logs when messages arrive`);
+    console.log(`   - Visit /api/debug/messages to see stored messages`);
+    console.log(`   - Check ngrok web interface: http://localhost:4040`);
+    console.log(`   - See WEBHOOK_TROUBLESHOOTING.md for detailed guide`);
+    console.log(`========================================\n`);
+  });
+}
+
+// Export for Vercel serverless functions
+module.exports = app;
